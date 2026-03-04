@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Maghrib Countdown</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .pill { display: inline-block; padding: 6px 10px; border-radius: 999px; background: #f3f3f3; }
+    pre { background: #fafafa; border: 1px solid #eee; padding: 12px; border-radius: 10px; overflow: auto; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: white; cursor: pointer; }
+    button:hover { background: #f6f6f6; }
+  </style>
+</head>
+<body>
+  <h1>Maghrib time remaining (Adhan)</h1>
+
+  <div class="card">
+    <div class="row">
+      <div class="pill" id="status">Status: idle</div>
+      <div class="pill" id="coords">Coords: —</div>
+      <div class="pill" id="tz">Timezone: —</div>
+    </div>
+
+    <p><button id="btn">Get prayer times & countdown</button></p>
+
+    <h3>Today’s times (from API)</h3>
+    <pre id="times">—</pre>
+
+    <h2 id="maghribLine">Maghrib: —</h2>
+    <h2 id="countdown">Time until Maghrib: —</h2>
+    <p id="note" style="color:#555"></p>
+  </div>
+
+  <script>
+    const elStatus = document.getElementById("status");
+    const elCoords = document.getElementById("coords");
+    const elTz = document.getElementById("tz");
+    const elTimes = document.getElementById("times");
+    const elMaghrib = document.getElementById("maghribLine");
+    const elCountdown = document.getElementById("countdown");
+    const elNote = document.getElementById("note");
+    const btn = document.getElementById("btn");
+
+    let timerId = null;
+    let maghribDate = null;
+
+    function setStatus(msg) {
+      elStatus.textContent = "Status: " + msg;
+    }
+
+    function pad2(n) { return String(n).padStart(2, "0"); }
+
+    function formatDuration(ms) {
+      const abs = Math.abs(ms);
+      const totalSeconds = Math.floor(abs / 1000);
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+      return `${hours}h ${minutes}m ${seconds}s`;
+    }
+
+    // Parses API time strings like "18:42 (CEST)" or "18:42"
+    function parseApiTimeToLocalDate(apiTime, baseDate = new Date()) {
+      const m = String(apiTime).match(/(\d{1,2}):(\d{2})/);
+      if (!m) return null;
+      const hh = Number(m[1]);
+      const mm = Number(m[2]);
+
+      // Build a Date in the user's local timezone for "today"
+      const d = new Date(baseDate);
+      d.setHours(hh, mm, 0, 0);
+      return d;
+    }
+
+    function updateCountdown() {
+      if (!maghribDate) return;
+
+      const now = new Date();
+      const diff = maghribDate - now;
+
+      if (diff >= 0) {
+        elCountdown.textContent = "Time until Maghrib: " + formatDuration(diff);
+        elNote.textContent = "";
+      } else {
+        elCountdown.textContent = "Maghrib already passed: " + formatDuration(diff) + " ago";
+        elNote.textContent = "If you want the *next* Maghrib (tomorrow), refresh after midnight or adjust code to fetch tomorrow’s date.";
+      }
+    }
+
+    async function getPrayerTimes(lat, lon) {
+      // AlAdhan Timings endpoint (by coordinates)
+      // docs: https://aladhan.com/prayer-times-api
+      const url = `https://api.aladhan.com/v1/timings?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&method=2`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("API request failed: " + res.status);
+      const json = await res.json();
+      if (!json?.data?.timings) throw new Error("Unexpected API response");
+      return json.data;
+    }
+
+    function stopTimer() {
+      if (timerId) clearInterval(timerId);
+      timerId = null;
+    }
+
+    async function run() {
+      stopTimer();
+      elTimes.textContent = "—";
+      elMaghrib.textContent = "Maghrib: —";
+      elCountdown.textContent = "Time until Maghrib: —";
+      elNote.textContent = "";
+
+      setStatus("requesting location…");
+
+      if (!navigator.geolocation) {
+        setStatus("geolocation not supported");
+        return;
+      }
+
+      navigator.geolocation.getCurrentPosition(async (pos) => {
+        try {
+          const lat = pos.coords.latitude;
+          const lon = pos.coords.longitude;
+          elCoords.textContent = `Coords: ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+          elTz.textContent = `Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`;
+
+          setStatus("fetching prayer times…");
+          const data = await getPrayerTimes(lat, lon);
+
+          const timings = data.timings;
+          // Common keys: Fajr, Sunrise, Dhuhr, Asr, Maghrib, Isha
+          elTimes.textContent = JSON.stringify(timings, null, 2);
+
+          const maghribStr = timings.Maghrib;
+          maghribDate = parseApiTimeToLocalDate(maghribStr, new Date());
+
+          if (!maghribDate) {
+            setStatus("could not parse Maghrib time");
+            return;
+          }
+
+          const hh = pad2(maghribDate.getHours());
+          const mm = pad2(maghribDate.getMinutes());
+          elMaghrib.textContent = `Maghrib: ${hh}:${mm} (local time)`;
+
+          setStatus("running countdown");
+          updateCountdown();
+          timerId = setInterval(updateCountdown, 1000);
+
+        } catch (err) {
+          console.error(err);
+          setStatus("error: " + (err?.message || err));
+        }
+      }, (err) => {
+        setStatus("location error: " + err.message);
+      }, {
+        enableHighAccuracy: true,
+        timeout: 15000,
+        maximumAge: 60000
+      });
+    }
+
+    btn.addEventListener("click", run);
+  </script>
+</body>
+</html>
