@@ -734,6 +734,10 @@
   resize(); makeStars(); requestAnimationFrame(draw);
 })();
 
+// Always display times in the USER'S local timezone (the browser's timezone)
+// regardless of where the JS runtime is hosted (Vercel UTC, etc.)
+const USER_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
 /* ═══════════════════════════ STATE ═══════════════════════════ */
 const state = {
   lat: null, lon: null,
@@ -744,8 +748,9 @@ const state = {
   prayerDates: {},
   nextPrayer: null,
   nextPrayerDate: null,
-  calYear: new Date().getFullYear(),
-  calMonth: new Date().getMonth(),
+  // Use user's local date for calendar init, not server UTC date
+  calYear: +new Date().toLocaleDateString('en-CA', {timeZone: USER_TZ||'UTC'}).split('-')[0],
+  calMonth: +new Date().toLocaleDateString('en-CA', {timeZone: USER_TZ||'UTC'}).split('-')[1] - 1,
   selectedDay: null,
   dayCache: {},
   countdownTimer: null
@@ -762,12 +767,55 @@ const prayerMeta = {
 
 /* ═══════════════════════════ UTILS ═══════════════════════════ */
 function pad2(n){ return String(n).padStart(2,'0'); }
-function fmtHHMM(d){ return d ? `${pad2(d.getHours())}:${pad2(d.getMinutes())}` : '—'; }
-function parseApiTime(t, base=new Date()){
-  const m=String(t).match(/(\d{1,2}):(\d{2})/);
-  if(!m) return null;
-  const d=new Date(base); d.setHours(+m[1],+m[2],0,0); return d;
+
+function fmtHHMM(d){
+  if(!d) return '—';
+  // Format in the user's local timezone so display is always correct
+  return d.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit', timeZone: USER_TZ });
 }
+
+// Parse an "HH:MM" string from the API into a real UTC Date.
+// The API returns wall-clock times in the timezone we passed it (USER_TZ).
+// We reconstruct a proper UTC timestamp using the date string + wall-clock time + tz.
+function parseApiTime(timeStr, dateStr){
+  // timeStr: "15:51" or "15:51 (WET)"
+  const m = String(timeStr).match(/(\d{1,2}):(\d{2})/);
+  if(!m) return null;
+  const hh = m[1].padStart(2,'0'), mm = m[2];
+  // Build an ISO-like string interpreted in USER_TZ via Temporal-free trick:
+  // Use the date parts + time + timezone to get the correct UTC epoch.
+  try {
+    // "2025-03-04T15:51:00" treated as wall-clock in USER_TZ
+    const localIso = `${dateStr}T${hh}:${mm}:00`;
+    // Intl trick: format a known UTC time in the target tz, binary-search is overkill.
+    // Simpler: use the offset the browser already knows for that tz on that date.
+    const probe = new Date(`${localIso}Z`); // parse as UTC first (wrong epoch)
+    // Get what the browser thinks the UTC-equivalent of localIso in USER_TZ is:
+    const tzOffset = getTzOffsetMs(USER_TZ, probe);
+    return new Date(probe.getTime() - tzOffset);
+  } catch(e) {
+    // Fallback: parse naively (will be wrong on Vercel but correct locally)
+    const [y,mo,da] = dateStr.split('-');
+    const d = new Date(+y, +mo-1, +da, +m[1], +m[2], 0, 0);
+    return d;
+  }
+}
+
+// Returns the offset in ms between UTC and USER_TZ at a given UTC timestamp.
+// Calculated by formatting a UTC date in the tz and comparing.
+function getTzOffsetMs(tz, utcDate){
+  // Format the UTC timestamp as wall-clock in the target timezone
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12: false
+  }).formatToParts(utcDate);
+  const get = type => parts.find(p=>p.type===type)?.value;
+  // Reconstruct wall-clock as if it were UTC
+  const wallAsUtc = Date.UTC(+get('year'), +get('month')-1, +get('day'), +get('hour'), +get('minute'), +get('second'));
+  return wallAsUtc - utcDate.getTime();
+}
+
 function formatDurParts(ms){
   const abs=Math.abs(ms), ts=Math.floor(abs/1000);
   return { h:pad2(Math.floor(ts/3600)), m:pad2(Math.floor((ts%3600)/60)), s:pad2(ts%60) };
@@ -788,7 +836,8 @@ function hijriDate(date){
 /* ═══════════════════════════ API ═══════════════════════════ */
 async function fetchTimings(lat, lon, dateStr){
   const [y,m,d] = dateStr.split('-');
-  const url=`https://api.aladhan.com/v1/timings/${d}-${m}-${y}?latitude=${lat}&longitude=${lon}&method=2`;
+  // Pass the user's IANA timezone to the API so it returns correct local wall-clock times
+  const url=`https://api.aladhan.com/v1/timings/${d}-${m}-${y}?latitude=${lat}&longitude=${lon}&method=2&timezonestring=${encodeURIComponent(USER_TZ)}`;
   const res=await fetch(url);
   if(!res.ok) throw new Error('HTTP '+res.status);
   const j=await res.json();
@@ -997,8 +1046,8 @@ document.getElementById('calNext').addEventListener('click',()=>{
 /* ═══════════════════════════ INIT DATE DISPLAY ═══════════════════════════ */
 function refreshHeader(){
   const now=new Date();
-  document.getElementById('dateText').textContent=now.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
-  document.getElementById('tzText').textContent=Intl.DateTimeFormat().resolvedOptions().timeZone;
+  document.getElementById('dateText').textContent=now.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short', timeZone: USER_TZ});
+  document.getElementById('tzText').textContent=USER_TZ;
 }
 
 /* ═══════════════════════════ MAIN FETCH ═══════════════════════════ */
@@ -1013,16 +1062,17 @@ async function run(){
       document.getElementById('locText').textContent=`${state.lat.toFixed(4)}, ${state.lon.toFixed(4)}`;
       showToast('Fetching prayer times…', 60000);
 
-      const today=new Date();
-      const key=`${today.getFullYear()}-${pad2(today.getMonth()+1)}-${pad2(today.getDate())}`;
+      // Get today's date in the USER's timezone (not the server's UTC date)
+      const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: USER_TZ }); // "YYYY-MM-DD"
+      const key = todayStr;
       const data=await fetchTimings(state.lat, state.lon, key);
       const timings=data.timings;
       state.timings=timings;
       state.dayCache[key]=timings;
 
-      // Parse all prayer times
+      // Parse all prayer times — pass dateStr so timezone math is exact
       for(const p of state.prayerOrder){
-        const d=parseApiTime(timings[p], today);
+        const d=parseApiTime(timings[p], key);
         if(d) state.prayerDates[p]=d;
       }
       state.sunriseDate=state.prayerDates['Sunrise'];
